@@ -8,13 +8,12 @@ import logfire
 
 from .tasks import UserInstructions
 from .dataset import get_dataset
-from .user_agent import get_user_agent
+from .user_agent import get_user_agent, EndConversation
 from ..mcp_servers.retail.agent import get_agent
 from ..mcp_servers.retail.tools import server, retail
-from ..toolset.disable_toolcall import DisableToolcallToolset
+from ..mcp_servers.disable_toolcall import DisableToolcallWrapper
+from ..mcp_servers.mcp_zero.mcp_zero import get_mcp_zero_toolsets
 
-
-END_TOKENS = ("###STOP###", "###TRANSFER###", "###OUT-OF-SCOPE###")
 
 logfire.configure(
     service_name="benchmark",
@@ -27,7 +26,7 @@ logfire.instrument_mcp()
 
 
 async def evaluate(
-    toolsets: Literal["relevant-only", "double"],
+    toolsets: Literal["relevant-only", "double", "mcp-zero", "half-mcp-zero"],
     max_cases: int | None = None,
     max_turns: int = 10,
 ):
@@ -40,7 +39,9 @@ async def evaluate(
         Toolsets to add to the evaluatee agent.
         `relevant-only` adds only tools that are relevant to the dataset.
         `double` adds tools that are completely irrelevant to the dataset.
-        This doubles the amount of tools from 15 to 30.
+            This doubles the amount of tools from 15 to 30.
+        `mcp-zero` adds 2666 extra tools in addition to the relevant ones.
+        `half-mcp-zero` adds 1334 extra tools instead.
     :param max_cases: Limit the number of cases included in the dataset.
     :param max_turns: Maximum number of dialog turns in each conversation.
     """
@@ -51,10 +52,24 @@ async def evaluate(
         agent = await get_agent(
             toolsets=[
                 FastMCPToolset(server),
-                DisableToolcallToolset(create_todo_toolset(enable_subtasks=True)),
-                DisableToolcallToolset(
+                DisableToolcallWrapper(create_todo_toolset(enable_subtasks=True)),
+                DisableToolcallWrapper(
                     FileSystemToolset.create_default("./data", mode="rw")
                 ),
+            ]
+        )
+    elif toolsets == "mcp-zero":
+        agent = await get_agent(
+            toolsets=[
+                FastMCPToolset(server),
+                *get_mcp_zero_toolsets(),
+            ]
+        )
+    elif toolsets == "half-mcp-zero":
+        agent = await get_agent(
+            toolsets=[
+                FastMCPToolset(server),
+                *(get_mcp_zero_toolsets()[:130]),
             ]
         )
 
@@ -67,9 +82,7 @@ async def evaluate(
         agent_responses = []
         counter = 0
         try:
-            while counter < max_turns and not any(
-                token in last_message for token in END_TOKENS
-            ):
+            while counter < max_turns and not isinstance(last_message, EndConversation):
                 agent_response = await agent.run(
                     user_prompt=last_message,
                     message_history=agent_history,

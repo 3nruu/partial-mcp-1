@@ -66,6 +66,11 @@ and compare agent's performance.
 Irrelevant toolsets added are definition-only.
 Whenever agent tries to call them, an exception is raised instead.
 
+Some irrelevant tools come from pydantic toolset packages such as:
+- `pydantic-ai-todo`
+- `pydantic-ai-filesystem-sandbox`
+And others come from [MCP Zero](https://github.com/xfey/MCP-Zero)'s 300+ toolsets.
+
 ### Suggested solutions
 
 Below are possible solutions to the problem of presence of irrelevant tools:
@@ -123,9 +128,15 @@ To run the benchmark in its original version, execute:
 uv run poe benchmark relevant-only
 ```
 
-To run the benchmark with irrelevant tools, execute:
+To run the benchmark with irrelevant tools, execute either one of the three:
 ```bash
-uv run poe benchmark double
+uv run poe benchmark double        # 15 extra tools
+```
+```bash
+uv run poe benchmark half-mcp-zero # 1334 extra tools
+```
+```bash
+uv run poe benchmark mcp-zero      # 2666 extra tools
 ```
 
 In either case, you can limit the number of cases tested if you want

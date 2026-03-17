@@ -21,7 +21,7 @@ envfile = ".env"
     [tool.poe.tasks.benchmark.args.toolsets]
     required = true
     positional = true
-    choices = ["relevant-only", "double"]
+    choices = ["relevant-only", "double", "mcp-zero", "half-mcp-zero"]
     help = "The number of tools added to the agent"
 
     [tool.poe.tasks.benchmark.args.max_cases]

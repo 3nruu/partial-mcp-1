@@ -87,6 +87,7 @@ class ToolCallMetrics(Evaluator[object, object, object]):
     ignore_read_only: bool = False
     """Whether to ignore read only tools when calculating the score."""
 
+# Добавить метрики на сиквенс, 
     def evaluate(
         self,
         ctx: EvaluatorContext[object, object, object],

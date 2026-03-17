@@ -10,6 +10,7 @@ dependencies = [
     "pydantic-ai-todo",
     "pydantic-ai-filesystem-sandbox",
     "poethepoet",
+    "sentence-transformers>=5.2.3",
 ]
 
 [tool.poe.tasks.benchmark]

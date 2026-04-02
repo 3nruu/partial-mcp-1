@@ -24,8 +24,8 @@ produce the UPDATED plan that reflects the user's latest intent.
 EXISTING PLAN:
 {existing_plan}
 
-COMPLETED STEPS:
-{completed_steps}
+ALREADY CALLED TOOLS:
+{called_tools}
 
 CONVERSATION:
 {history}
@@ -38,7 +38,7 @@ LATEST USER MESSAGE:
 RULES:
 
 1. Always return a FULL plan (remaining steps only).
-2. Do NOT include steps that are already completed.
+2. Do NOT include steps for tools that are already in ALREADY CALLED TOOLS.
 3. Use abstract, high-level actions (NOT tool names).
 4. Keep steps minimal (1–4 steps max).
 
@@ -67,9 +67,11 @@ RULES:
 12. If plan is still valid → keep it.
 13. If intent changed → update plan.
 
----
+14. CRITICAL: ALREADY CALLED TOOLS lists tools that have already been executed.
+    Do NOT generate steps whose sole purpose is to call one of these tools again.
+    Their results are already in the conversation history — skip those steps entirely.
 
-EXAMPLE:
+---
 
 EXAMPLE:
 
@@ -104,11 +106,6 @@ MAX_TOOLS_HARD_CAP = 3
 SCORE_THRESHOLD = 0.42
 
 USER_LOOKUP_TOOLS = {"find_user_id_by_name_zip", "find_user_id_by_email"}
-ORDER_LOOKUP_TOOLS = {"get_order_details", "get_user_details"}
-MUTATING_STEP_KEYWORDS = {
-    "exchange", "return", "cancel", "update", "modify",
-    "change", "process", "initiate", "transfer", "payment",
-}
 
 
 class Toolset(CombinedToolset):
@@ -126,10 +123,7 @@ class Toolset(CombinedToolset):
         self.MAX_TOOL_CALLS = 50000
 
         self.plan: list[dict] = []
-        self.completed_steps: set[str] = set()
-        self.last_step: str | None = None
         self.have_user: bool = False
-        self.have_order: bool = False
         self._first_msg: str = ""
 
         self.llm_client = openai.AsyncOpenAI(
@@ -138,21 +132,11 @@ class Toolset(CombinedToolset):
         )
         self.llm_model = "Qwen/Qwen3-30B-A3B"
 
-    def _plan_has_mutating_step(self) -> bool:
-        for step in self.plan:
-            words = (step.get("step", "") + " " + step.get("evidence", "")).lower().split()
-            if any(w in MUTATING_STEP_KEYWORDS for w in words):
-                return True
-        return False
-
     def _reset_state(self) -> None:
         self._tool_call_counts = {}
         self._called_tools = set()
         self.plan = []
-        self.completed_steps = set()
-        self.last_step = None
         self.have_user = False
-        self.have_order = False
 
     async def prepare(self):
         base_path = Path(__file__).parent
@@ -229,18 +213,18 @@ class Toolset(CombinedToolset):
         history_str = "\n".join(user_msgs[-2:]) or "No previous messages."
 
         existing_plan_str = json.dumps([s["step"] for s in self.plan], ensure_ascii=False) if self.plan else "none"
-        completed_steps_str = json.dumps(list(self.completed_steps), ensure_ascii=False) if self.completed_steps else "[]"
+        called_tools_str = json.dumps(sorted(self._called_tools), ensure_ascii=False) if self._called_tools else "[]"
 
         prompt = PLANNER_PROMPT.format(
             existing_plan=existing_plan_str,
-            completed_steps=completed_steps_str,
+            called_tools=called_tools_str,
             history=history_str,
             query=user_query,
         )
 
         content = await self._llm_call(prompt)
         if content is None:
-            return [{"step": user_query.strip(), "evidence": user_query.strip()}]
+            return None
 
         parsed = self._parse_json_response(content)
 
@@ -329,26 +313,18 @@ class Toolset(CombinedToolset):
             return lookup_tools if lookup_tools else original_tools
 
         # Always regenerate plan to reflect completed steps
-        plan = await self._create_plan(user_query, history) or [{"step": user_query.strip(), "evidence": user_query.strip()}]
-        self.plan = plan
-
+        plan = await self._create_plan(user_query, history)
         if not plan:
-            return original_tools
-
-        # If plan has mutating steps and order not yet fetched — show only order lookup
-        if not self.have_order and self._plan_has_mutating_step():
-            order_tools = {k: v for k, v in original_tools.items() if k in ORDER_LOOKUP_TOOLS}
             print(f"-----------------------------------------")
-            print(f"HISTORY_LEN: {history_len}  | have_order=False + mutating plan -> showing only order lookup")
+            print(f"HISTORY_LEN: {history_len}  | have_user={self.have_user}  | CALLED: {sorted(self._called_tools) or 'none'}")
             print(f"USER QUERY : {user_query[:120]!r}")
-            print(f"FULL PLAN  : {[s['step'] for s in plan]}")
-            print(f"SELECTED   : {list(order_tools)}")
-            return order_tools if order_tools else original_tools
+            print(f"!! FALLBACK: empty plan -> returning ALL {len(original_tools)} tools")
+            return original_tools
+        self.plan = plan
 
         current = plan[0]
 
         step = current["step"]
-        self.last_step = step
         evidence = current.get("evidence", "")
         if len(evidence.split()) < 3:
             evidence = user_query[:100]
@@ -379,19 +355,13 @@ class Toolset(CombinedToolset):
             if tool_id in original_tools
         }
 
-        # Always inject get_user_details when user is known but order is not yet fetched
-        # (lets the agent look up order IDs when user doesn't know them)
-        if self.have_user and not self.have_order and "get_user_details" in original_tools:
-            selected_tools["get_user_details"] = original_tools["get_user_details"]
-
         fallback = not selected_tools
 
         print(f"-----------------------------------------")
-        print(f"HISTORY_LEN: {history_len}  | have_user={self.have_user}  | have_order={self.have_order}  | CALLED: {sorted(self._called_tools) or 'none'}")
+        print(f"HISTORY_LEN: {history_len}  | have_user={self.have_user}  | CALLED: {sorted(self._called_tools) or 'none'}")
         print(f"USER QUERY : {user_query[:120]!r}")
         print(f"ACTIVE STEP: {step!r}  (evidence: {evidence[:60]!r})")
         print(f"FULL PLAN  : {[s['step'] for s in plan]}")
-        print(f"COMPLETED  : {sorted(self.completed_steps) or 'none'}")
         print(f"SUB QUERIES: {sub_queries}")
         print(f"CANDIDATES : {[(t, round(s, 3)) for t, s in sorted(candidates.items(), key=lambda x: -x[1])]}")
         print(f"MAX_TOOLS  : {max_tools}  | THRESHOLD: {SCORE_THRESHOLD}")
@@ -414,12 +384,8 @@ class Toolset(CombinedToolset):
         result_preview = str(result)[:120]
         print(f"CALL_TOOL  : {name}({tool_args}) -> OK | {result_preview}")
         self._called_tools.add(name)
-        if self.last_step:
-            self.completed_steps.add(self.last_step)
         if name in USER_LOOKUP_TOOLS:
             self.have_user = True
-        if name == "get_order_details":
-            self.have_order = True
         return result
 
     def visit_and_replace(self, visitor):

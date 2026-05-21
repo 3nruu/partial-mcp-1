@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic_ai import Agent, AbstractToolset
 
-from ...toolset.toolset import Toolset
+from ...toolset.toolset_last import Toolset
 from ...model import model
 
 

@@ -12,100 +12,129 @@ from pydantic_ai.tools import RunContext
 
 from .utils import extract_message_history_from_context, extract_query_from_context, AssistantMessage
 
-PLANNER_PROMPT = """
-You are a planning agent for an e-commerce assistant.
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
-Your job:
-Given the conversation and an existing plan,
-produce the UPDATED plan that reflects the user's latest intent.
+DECOMPOSE_PROMPT = """You are an intent planner for an e-commerce support agent.
 
----
+Goal:
+Given the conversation history, the latest user message, and the current progress state,
+identify 1–3 REMAINING intents that the agent still needs to execute.
 
-EXISTING PLAN:
-{existing_plan}
+Current progress:
+{state}
 
-ALREADY CALLED TOOLS:
-{called_tools}
+Rules:
+- Only output intents for steps that are NOT yet completed.
+- If the user is already identified (user_identified = true), do NOT output intents with needs_user_lookup = true.
+  Instead, focus on the next steps: fetching order details, performing exchanges, etc.
+- If an order is already loaded (order_loaded = true), do NOT output intents with needs_order_details = true.
+  Instead, focus on the actual mutation or information retrieval.
+- If both are done and a mutating action is needed, output the mutation intent directly.
+- Focus on high-level intents, not micro-steps.
+- Use the original user request to decide if the intent changes data (mutating) or only reads data.
+- Preserve entities from the request: email, username, order id, zipcode, item names, actions.
+- The description field is used as a search query for tool retrieval, so make it specific and action-oriented.
 
-CONVERSATION:
+Output:
+Return ONLY a JSON array of objects with fields:
+- name: short snake_case name of intent
+- description: 1–2 sentence description (3–8 words, verb + object format, useful as a search query for tool retrieval)
+- is_mutating: boolean — true if the action creates, updates, or deletes data; false if it only reads
+- needs_user_lookup: boolean — true if executing this intent requires identifying the user first (and user is NOT yet identified)
+- needs_order_details: boolean — true if executing this intent requires fetching a specific order (and order is NOT yet loaded)
+
+JSON schema for one intent object:
+{{
+  "name": "<snake_case>",
+  "description": "<short verb+object phrase>",
+  "is_mutating": <true|false>,
+  "needs_user_lookup": <true|false>,
+  "needs_order_details": <true|false>
+}}
+
+Conversation history:
 {history}
 
-LATEST USER MESSAGE:
+Latest user message:
 {query}
 
----
-
-RULES:
-
-1. Always return a FULL plan (remaining steps only).
-2. Do NOT include steps for tools that are already in ALREADY CALLED TOOLS.
-3. Use abstract, high-level actions (NOT tool names).
-4. Keep steps minimal (1–4 steps max).
-
-5. Each step must include:
-   - "step": action (verb + object)
-   - "evidence": SHORT fragment of user message that justifies this step
-
-6. Evidence must be copied or lightly rewritten from the user message.
-
-7. CRITICAL: Steps must follow correct execution order:
-
-   - FIRST: identify user (if user not yet identified)
-   - THEN: fetch required data (e.g. order details)
-   - THEN: validate or understand request (if needed)
-   - LAST: perform any mutating action (exchange, cancel, update, return)
-
-8. NEVER start with a mutating step (exchange, cancel, update, etc).
-9. NEVER perform mutation before user identification and data retrieval.
-
-10. If the user request involves changing something:
-    ALWAYS include prerequisite steps (identify user → fetch data → then mutate)
-
-11. Do NOT create unnecessary steps like "determine specifications"
-    if the information is already provided in the user message.
-
-12. If plan is still valid → keep it.
-13. If intent changed → update plan.
-
-14. CRITICAL: ALREADY CALLED TOOLS lists tools that have already been executed.
-    Do NOT generate steps whose sole purpose is to call one of these tools again.
-    Their results are already in the conversation history — skip those steps entirely.
-
----
-
-EXAMPLE:
-
-{{
-  "plan": [
-    {{
-      "step": "identify user",
-      "evidence": "my name is john_doe, zipcode 12345"
-    }},
-    {{
-      "step": "exchange items",
-      "evidence": "exchange the lamp and bottle"
-    }}
-  ]
-}}
-
----
-
-OUTPUT FORMAT (JSON ONLY):
-
-{{
-  "plan": [
-    {{"step": "...", "evidence": "..."}}
-  ]
-}}
+JSON:
 """
 
+VALIDATOR_PROMPT = """You are a tool selection validator.
+
+Your job is to decide which tools are actually required to complete the user's request.
+
+You will receive:
+1) The original user message
+2) A list of intents (high-level goals) derived from that message
+3) A list of candidate tools with descriptions
+
+Rules:
+- Keep ONLY tools that are directly useful for solving the user request.
+- Use the original user message to understand the real intent and important entities (email, username, zipcode, order id, items, etc).
+- If a tool does not clearly help complete one of the sub-tasks or the user request, remove it.
+- Prefer tools that match the entities mentioned in the user message.
+- Do NOT include tools that rely on information the user did not provide (for example email if only username is given).
+- Return only tool names from the candidate list.
+- Do NOT explain anything.
+
+Original user message:
+{user_query}
+
+Intents:
+{intents}
+
+Candidate tools:
+{tools}
+
+Return ONLY a JSON array of tool names.
+Output:
+"""
+
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 TOP_K_PER_SUBQUERY = 2
 MIN_TOOLS = 1
-MAX_TOOLS_HARD_CAP = 3
+MAX_TOOLS_HARD_CAP = 6
 SCORE_THRESHOLD = 0.42
 
-USER_LOOKUP_TOOLS = {"find_user_id_by_name_zip", "find_user_id_by_email"}
+READ_ONLY_TOOLS = {
+    "find_user_id_by_email",
+    "find_user_id_by_name_zip",
+    "get_user_details",
+    "get_order_details",
+    "get_product_details",
+    "list_all_product_types",
+    "calculate",
+}
+
+USER_LOOKUP = {"find_user_id_by_email", "find_user_id_by_name_zip"}
+
+TOOL_PREREQUISITES: dict[str, set[str]] = {
+    "modify_pending_order_items":     USER_LOOKUP | {"get_order_details"},
+    "modify_pending_order_address":   USER_LOOKUP | {"get_order_details"},
+    "modify_pending_order_payment":   USER_LOOKUP | {"get_order_details"},
+    "cancel_pending_order":           USER_LOOKUP | {"get_order_details"},
+    "exchange_delivered_order_items":  USER_LOOKUP | {"get_order_details"},
+    "return_delivered_order_items":    USER_LOOKUP | {"get_order_details"},
+    "modify_user_address":            USER_LOOKUP,
+    "transfer_to_human_agents":       set(),
+}
+
+MUTATING_TOOLS = set(TOOL_PREREQUISITES.keys())
+
+
+# ── Default intent (fallback) ─────────────────────────────────────────────────
+
+def _default_intent(query: str) -> dict:
+    return {
+        "name": "unknown",
+        "description": query.strip(),
+        "is_mutating": False,
+        "needs_user_lookup": False,
+        "needs_order_details": False,
+    }
 
 
 class Toolset(CombinedToolset):
@@ -122,9 +151,9 @@ class Toolset(CombinedToolset):
         self._tool_call_counts: dict[str, int] = {}
         self.MAX_TOOL_CALLS = 50000
 
-        self.plan: list[dict] = []
+        # ── State graph flags ─────────────────────────────────────────────
         self.have_user: bool = False
-        self._first_msg: str = ""
+        self.have_order: bool = False
 
         self.llm_client = openai.AsyncOpenAI(
             api_key="sk-ZHM89bb2lzWmkBc-0IL_GQ",
@@ -132,15 +161,58 @@ class Toolset(CombinedToolset):
         )
         self.llm_model = "Qwen/Qwen3-30B-A3B"
 
-    def _reset_state(self) -> None:
-        self._tool_call_counts = {}
-        self._called_tools = set()
-        self.plan = []
-        self.have_user = False
+    # ── State helpers ─────────────────────────────────────────────────────────
+
+    def _update_state(self, tool_name: str) -> None:
+        """Transition the state graph after a tool call."""
+        if tool_name in USER_LOOKUP:
+            self.have_user = True
+        if tool_name == "get_order_details":
+            self.have_order = True
+
+    def _is_ready_for_mutation(self, intent: dict) -> bool:
+        """Check if the current state allows mutating actions for this intent."""
+        if not intent.get("is_mutating"):
+            return False
+        if intent.get("needs_user_lookup") and not self.have_user:
+            return False
+        if intent.get("needs_order_details") and not self.have_order:
+            return False
+        return True
+
+    def _prerequisites_met(self, tool_id: str, primary_intent: dict) -> bool:
+        """
+        Graph-based gate: decides whether a tool is allowed given
+        the current state + the primary intent.
+        """
+        # 1) Global ban on mutating tools when context is insufficient
+        if tool_id in MUTATING_TOOLS:
+            if not self._is_ready_for_mutation(primary_intent):
+                return False
+
+        # 2) Cannot call get_user_details without having identified the user
+        if tool_id == "get_user_details" and not self.have_user:
+            return False
+
+        # 3) Cannot call get_order_details without having identified the user
+        if tool_id == "get_order_details" and not self.have_user:
+            return False
+
+        # 4) Standard prereqs from the prerequisite map
+        prereqs = TOOL_PREREQUISITES.get(tool_id)
+        if prereqs:
+            if USER_LOOKUP & prereqs and not self.have_user:
+                return False
+            if "get_order_details" in prereqs and not self.have_order:
+                return False
+
+        return True
+
+    # ── Prepare ───────────────────────────────────────────────────────────────
 
     async def prepare(self):
         base_path = Path(__file__).parent
-        query_file = base_path / "query_embeddings_v2.json"
+        query_file = base_path / "query_embeddings.json"
         desc_file = base_path / "tool_embeddings.json"
 
         if not query_file.exists():
@@ -190,9 +262,16 @@ class Toolset(CombinedToolset):
         except json.JSONDecodeError:
             return None
 
-    # ── Stage 1: QueryDecomposer ───────────────────────────────────────────────
+    # ── Stage 1: Intent Decomposer ────────────────────────────────────────────
 
-    async def _create_plan(self, user_query: str, history: list) -> list[str]:
+    async def _decompose_query(self, user_query: str, history: list) -> list[dict]:
+        """
+        Returns a list of intent dicts, each with:
+          name, description, is_mutating, needs_user_lookup, needs_order_details
+
+        State-aware: tells the LLM what's already accomplished so it only
+        generates remaining steps.
+        """
         user_msgs = []
         for msg in history:
             if getattr(msg, "kind", None) != "user":
@@ -212,39 +291,62 @@ class Toolset(CombinedToolset):
 
         history_str = "\n".join(user_msgs[-2:]) or "No previous messages."
 
-        existing_plan_str = json.dumps([s["step"] for s in self.plan], ensure_ascii=False) if self.plan else "none"
-        called_tools_str = json.dumps(sorted(self._called_tools), ensure_ascii=False) if self._called_tools else "[]"
+        state_str = (
+            f"- user_identified: {self.have_user}  "
+            f"{'(user account already found, no need to look up again)' if self.have_user else '(user not yet identified)'}\n"
+            f"- order_loaded: {self.have_order}  "
+            f"{'(order details already fetched)' if self.have_order else '(order not yet fetched — may need get_order_details)'}\n"
+            f"- tools_already_called: {sorted(self._called_tools) if self._called_tools else 'none'}"
+        )
 
-        prompt = PLANNER_PROMPT.format(
-            existing_plan=existing_plan_str,
-            called_tools=called_tools_str,
+        prompt = DECOMPOSE_PROMPT.format(
+            state=state_str,
             history=history_str,
             query=user_query,
         )
-
         content = await self._llm_call(prompt)
+
         if content is None:
-            return None
+            return [_default_intent(user_query)]
 
         parsed = self._parse_json_response(content)
 
-        if isinstance(parsed, dict) and "plan" in parsed:
-            steps = []
-            for item in parsed["plan"]:
-                if not isinstance(item, dict):
-                    continue
+        # Handle dict-wrapped responses like {"intents": [...]}
+        if isinstance(parsed, dict):
+            for key in ("intents", "intent", "results", "output"):
+                if key in parsed and isinstance(parsed[key], list):
+                    parsed = parsed[key]
+                    break
 
-                step = str(item.get("step", "")).strip()
-                evidence = str(item.get("evidence", "")).strip()
-
-                if 2 < len(step) < 80:
-                    steps.append({
-                        "step": step,
-                        "evidence": evidence
+        if isinstance(parsed, list) and parsed:
+            valid_intents = []
+            for item in parsed:
+                if isinstance(item, dict) and ("name" in item or "description" in item):
+                    valid_intents.append({
+                        "name": item.get("name", "unknown"),
+                        "description": item.get("description", ""),
+                        "is_mutating": bool(item.get("is_mutating", False)),
+                        "needs_user_lookup": bool(item.get("needs_user_lookup", False)),
+                        "needs_order_details": bool(item.get("needs_order_details", False)),
                     })
+            if valid_intents:
+                return self._postprocess_intents(valid_intents)
 
-            if steps:
-                return steps
+        return [_default_intent(user_query)]
+
+    def _postprocess_intents(self, intents: list[dict]) -> list[dict]:
+        """
+        Safety net: override intent flags based on actual state.
+        If user is already identified, needs_user_lookup must be False, etc.
+        This guards against LLM ignoring state context in the prompt.
+        """
+        for intent in intents:
+            if self.have_user:
+                intent["needs_user_lookup"] = False
+            if self.have_order:
+                intent["needs_order_details"] = False
+        return intents
+
     # ── Stage 2: Retriever ────────────────────────────────────────────────────
 
     def _retrieve(
@@ -272,8 +374,100 @@ class Toolset(CombinedToolset):
         filtered = {t: s for t, s in accum.items() if s >= SCORE_THRESHOLD}
         return filtered if filtered else accum
 
+    # ── Stage 3: ToolValidator ─────────────────────────────────────────────────
 
-    # ── Stage 4: get_tools ────────────────────────────────────────────────────
+    async def _validate_tools(
+        self,
+        user_query: str,
+        intents: list[dict],
+        candidates: dict[str, float],
+        original_tools: dict[str, ToolsetTool],
+    ) -> dict[str, float]:
+        if not candidates:
+            return candidates
+
+        tool_descriptions = []
+        for tool_id in candidates:
+            tool = original_tools.get(tool_id)
+            description = (
+                getattr(tool, "description", "")
+                or getattr(getattr(tool, "tool", None), "description", "")
+                or ""
+            ) if tool else ""
+            tool_descriptions.append(f"- {tool_id}: {description}")
+
+        intents_str = json.dumps(
+            [{"name": i.get("name"), "description": i.get("description")} for i in intents],
+            ensure_ascii=False,
+        )
+
+        prompt = VALIDATOR_PROMPT.format(
+            user_query=json.dumps(user_query),
+            intents=intents_str,
+            tools="\n".join(tool_descriptions),
+        )
+
+        content = await self._llm_call(prompt)
+        if content is None:
+            return candidates
+
+        approved = self._parse_json_response(content)
+        if not isinstance(approved, list):
+            return candidates
+
+        validated = {t: s for t, s in candidates.items() if t in approved}
+        if not validated:
+            return candidates
+
+        return validated
+
+    # ── Prerequisite expansion (graph walk) ─────────────────────────────────
+
+    def _expand_prerequisites(
+        self,
+        blocked: dict[str, ToolsetTool],
+        original: dict[str, ToolsetTool],
+    ) -> tuple[dict[str, ToolsetTool], list[str]]:
+        """
+        For every tool in `blocked` (tools that matched retrieval but can't
+        run yet), walk TOOL_PREREQUISITES backwards and collect prerequisite
+        tools that haven't been called yet.
+
+        Returns (prerequisite_tools, list_of_injected_names).
+        """
+        prereq_tools: dict[str, ToolsetTool] = {}
+        injected: list[str] = []
+
+        # Seed: all blocked tool ids
+        frontier = set(blocked.keys())
+        visited: set[str] = set()
+
+        while frontier:
+            tool_id = frontier.pop()
+            if tool_id in visited:
+                continue
+            visited.add(tool_id)
+
+            for prereq in TOOL_PREREQUISITES.get(tool_id, set()):
+                # Already called in a previous turn → satisfied
+                if prereq in self._called_tools:
+                    continue
+                # Not in the original toolset → can't add
+                if prereq not in original:
+                    continue
+                # Already collected → skip
+                if prereq in prereq_tools:
+                    continue
+
+                prereq_tools[prereq] = original[prereq]
+                injected.append(prereq)
+
+                # The prereq itself may have further prerequisites
+                frontier.add(prereq)
+
+        return prereq_tools, injected
+
+    # ── get_tools ─────────────────────────────────────────────────────────────
 
     async def get_tools(self, ctx: RunContext) -> dict[str, ToolsetTool]:
         original_tools = await super().get_tools(ctx)
@@ -283,93 +477,102 @@ class Toolset(CombinedToolset):
 
         user_query = extract_query_from_context(ctx)
 
-        #print(f"[GET_TOOLS] user_query={user_query!r:.100}")
-
         if not isinstance(user_query, str) or not user_query.strip():
             return original_tools
 
         history = extract_message_history_from_context(ctx)
 
         last_answer = next(
-                (msg.content for msg in reversed(history) if isinstance(msg, AssistantMessage)),
-                None,
-            )
+            (msg.content for msg in reversed(history) if isinstance(msg, AssistantMessage)),
+            None,
+        )
+
+        print(f"ASSISTANT: {last_answer}")
 
         history_len = len(history)
+        if history_len == 0:
+            self._tool_call_counts = {}
+            self._called_tools = set()
+            self.have_user = False
+            self.have_order = False
 
-        # Fix #1: reset state when a new conversation starts
-        first_msg = history[0].content if history else ""
-        if first_msg != self._first_msg:
-            self._reset_state()
-            self._first_msg = first_msg
+        # ── Stage 1: Intent decomposition ─────────────────────────────────
+        intents = await self._decompose_query(user_query, history)
+        primary_intent = intents[0] if intents else _default_intent(user_query)
 
-        # If user not yet identified — show only lookup tools
-        if not self.have_user:
-            lookup_tools = {k: v for k, v in original_tools.items() if k in USER_LOOKUP_TOOLS}
-            print(f"-----------------------------------------")
-            print(f"HISTORY_LEN: {history_len}  | have_user=False -> showing only lookup tools")
-            print(f"USER QUERY : {user_query[:120]!r}")
-            print(f"SELECTED   : {list(lookup_tools)}")
-            return lookup_tools if lookup_tools else original_tools
-
-        # Always regenerate plan to reflect completed steps
-        plan = await self._create_plan(user_query, history)
-        if not plan:
-            print(f"-----------------------------------------")
-            print(f"HISTORY_LEN: {history_len}  | have_user={self.have_user}  | CALLED: {sorted(self._called_tools) or 'none'}")
-            print(f"USER QUERY : {user_query[:120]!r}")
-            print(f"!! FALLBACK: empty plan -> returning ALL {len(original_tools)} tools")
-            return original_tools
-        self.plan = plan
-
-        current = plan[0]
-
-        step = current["step"]
-        evidence = current.get("evidence", "")
-        if len(evidence.split()) < 3:
-            evidence = user_query[:100]
-
+        # Derive sub-queries for embedding retrieval
         sub_queries = [
-            step,
-            evidence,
-            f"{step}. {evidence}"
-        ]
+            intent.get("description") or intent.get("name")
+            for intent in intents
+        ] or [user_query.strip()]
 
-        # Exclude already-used tools
-        available_tools = {
+        # Aggregate intent flags
+        any_mutating = any(i.get("is_mutating") for i in intents)
+
+        # ── Call-count filter only (no state gating yet) ──────────────────
+        retrieval_pool = {
             k: v for k, v in original_tools.items()
             if self._tool_call_counts.get(k, 0) < self.MAX_TOOL_CALLS
         } or original_tools
 
+        # Rule 3: hide mutating tools from retrieval if no mutating intent
+        if not any_mutating:
+            retrieval_pool = {
+                n: t for n, t in retrieval_pool.items()
+                if n not in MUTATING_TOOLS
+            } or retrieval_pool
 
-        # Stage 2
-        candidates = self._retrieve(sub_queries, available_tools)
+        # ── Stage 2: Embedding retrieval (against full pool) ──────────────
+        candidates = self._retrieve(sub_queries, retrieval_pool)
 
-        # Stage 4
-        max_tools = min(max(len(sub_queries) * TOP_K_PER_SUBQUERY, MIN_TOOLS), MAX_TOOLS_HARD_CAP)
-        top_n = sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:max_tools]
+        # ── Stage 3: LLM validation ──────────────────────────────────────
+        validated = await self._validate_tools(
+            user_query, intents, candidates, original_tools
+        )
 
-        selected_tools = {
+        # ── Stage 4: Top-N selection ─────────────────────────────────────
+        max_tools = min(
+            max(len(sub_queries) * TOP_K_PER_SUBQUERY, MIN_TOOLS),
+            MAX_TOOLS_HARD_CAP,
+        )
+        top_n = sorted(validated.items(), key=lambda x: x[1], reverse=True)[:max_tools]
+
+        all_matched = {
             tool_id: original_tools[tool_id]
             for tool_id, _ in top_n
             if tool_id in original_tools
         }
 
-        fallback = not selected_tools
+        # ── Stage 5: Split by readiness + expand prerequisites ───────────
+        #   allowed  = tools whose prerequisites are already satisfied
+        #   blocked  = tools that matched but can't run yet (state not ready)
+        allowed: dict[str, ToolsetTool] = {}
+        blocked: dict[str, ToolsetTool] = {}
 
-        print(f"-----------------------------------------")
-        print(f"HISTORY_LEN: {history_len}  | have_user={self.have_user}  | CALLED: {sorted(self._called_tools) or 'none'}")
-        print(f"USER QUERY : {user_query[:120]!r}")
-        print(f"ACTIVE STEP: {step!r}  (evidence: {evidence[:60]!r})")
-        print(f"FULL PLAN  : {[s['step'] for s in plan]}")
+        for tool_id, tool in all_matched.items():
+            if self._prerequisites_met(tool_id, primary_intent):
+                allowed[tool_id] = tool
+            else:
+                blocked[tool_id] = tool
+
+        # Walk the graph backwards from blocked tools → inject their prereqs
+        prereq_tools, injected = self._expand_prerequisites(blocked, original_tools)
+
+        selected_tools = {**allowed, **prereq_tools}
+
+        print(f"USER QUERY : {user_query}")
+        print(f"INTENTS    : {json.dumps(intents, ensure_ascii=False)}")
         print(f"SUB QUERIES: {sub_queries}")
-        print(f"CANDIDATES : {[(t, round(s, 3)) for t, s in sorted(candidates.items(), key=lambda x: -x[1])]}")
-        print(f"MAX_TOOLS  : {max_tools}  | THRESHOLD: {SCORE_THRESHOLD}")
+        print(f"STATE      : have_user={self.have_user}, have_order={self.have_order}")
+        print(f"MATCHED    : {list(all_matched)}")
+        print(f"ALLOWED    : {list(allowed)}")
+        print(f"BLOCKED    : {list(blocked)}")
+        print(f"INJECTED   : {injected}")
         print(f"SELECTED   : {list(selected_tools)}")
-        if fallback:
-            print(f"!! FALLBACK : selected_tools empty -> returning ALL {len(original_tools)} tools")
 
-        return selected_tools if not fallback else original_tools
+        return selected_tools if selected_tools else original_tools
+
+    # ── call_tool with state transition ───────────────────────────────────────
 
     async def call_tool(
         self,
@@ -380,12 +583,8 @@ class Toolset(CombinedToolset):
     ) -> Any:
         self._tool_call_counts[name] = self._tool_call_counts.get(name, 0) + 1
         result = await super().call_tool(name, tool_args, ctx, tool)
-        # only reached on success (exception would propagate without updating state)
-        result_preview = str(result)[:120]
-        print(f"CALL_TOOL  : {name}({tool_args}) -> OK | {result_preview}")
         self._called_tools.add(name)
-        if name in USER_LOOKUP_TOOLS:
-            self.have_user = True
+        self._update_state(name)
         return result
 
     def visit_and_replace(self, visitor):

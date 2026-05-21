@@ -79,6 +79,53 @@ class ToolCall(BaseModel, frozen=True):
 
 
 @dataclass(repr=False)
+class SelectedToolsMetrics(Evaluator[object, object, object]):
+    """Calculate F1/Precision/Recall for tools selected by the toolset (passed to agent)."""
+
+    tool_calls: list[ToolCall]
+    """Expected tool calls."""
+    ignore_read_only: bool = False
+
+    def evaluate(self, ctx: EvaluatorContext[object, object, object]) -> EvaluatorOutput:
+        selected_spans = ctx.span_tree.find(
+            lambda node: "Toolset: selected tools" in node.name
+        )
+        selected_names: set[str] = set()
+        for span in selected_spans:
+            if span.attributes.get("is_fallback"):
+                continue
+            raw = span.attributes.get("selected", "[]")
+            selected_names.update(json.loads(raw))
+
+        if self.ignore_read_only:
+            selected_names = {n for n in selected_names if n not in READ_ONLY_TOOLS}
+
+        expected_names = {
+            tc.name
+            for tc in self.tool_calls
+            if not self.ignore_read_only or tc.name not in READ_ONLY_TOOLS
+        }
+
+        tp = len(selected_names & expected_names)
+        fp = len(selected_names - expected_names)
+        fn = len(expected_names - selected_names)
+
+        precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+        recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
+        prefix = "SelectedWriteOnlyTools" if self.ignore_read_only else "SelectedAllTools"
+        return {
+            f"{prefix}F1": round(f1, 4),
+            f"{prefix}Precision": round(precision, 4),
+            f"{prefix}Recall": round(recall, 4),
+        }
+
+
+@dataclass(repr=False)
 class ToolCallMetrics(Evaluator[object, object, object]):
     """Calculate tool call F1, recall, precision metrics based on the spans collected by logfire."""
 
@@ -152,22 +199,16 @@ def get_dataset(max_cases: int | None = None):
     def get_evaluators_from_criteria(
         criteria: EvaluationCriteria,
     ) -> tuple[Evaluator, ...]:
+        expected = [
+            ToolCall(name=action.name, arguments=action.arguments)
+            for action in criteria.actions
+        ]
         return (
             *(Contains(info) for info in criteria.communicate_info),
-            ToolCallMetrics(
-                tool_calls=[
-                    ToolCall(name=action.name, arguments=action.arguments)
-                    for action in criteria.actions
-                ],
-                ignore_read_only=True,
-            ),
-            ToolCallMetrics(
-                tool_calls=[
-                    ToolCall(name=action.name, arguments=action.arguments)
-                    for action in criteria.actions
-                ],
-                ignore_read_only=False,
-            ),
+            ToolCallMetrics(tool_calls=expected, ignore_read_only=True),
+            ToolCallMetrics(tool_calls=expected, ignore_read_only=False),
+            SelectedToolsMetrics(tool_calls=expected, ignore_read_only=True),
+            SelectedToolsMetrics(tool_calls=expected, ignore_read_only=False),
         )
 
     current_dir = Path(__file__).parent

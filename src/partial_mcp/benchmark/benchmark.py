@@ -8,7 +8,7 @@ import logfire
 
 from .tasks import UserInstructions
 from .dataset import get_dataset
-from .user_agent import get_user_agent, EndConversation
+from .user_agent import get_user_agent
 from ..mcp_servers.retail.agent import get_agent
 from ..mcp_servers.retail.tools import server, retail
 from ..mcp_servers.disable_toolcall import DisableToolcallWrapper
@@ -82,7 +82,7 @@ async def evaluate(
         agent_responses = []
         counter = 0
         try:
-            while counter < max_turns and not isinstance(last_message, EndConversation):
+            while counter < max_turns:
                 agent_response = await agent.run(
                     user_prompt=last_message,
                     message_history=agent_history,

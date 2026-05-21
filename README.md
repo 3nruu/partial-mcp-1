@@ -6,7 +6,7 @@ Original repository:
 https://github.com/deeppavlov/partial-mcp
 
 My contribution includes:
-- multi-turn evaluation benchmark
+- added metrics and evaluation scenarios for multi-turn tool selection
 - state-aware tool filtering
 - retrieval/reranking modifications
 - planner architecture experiments

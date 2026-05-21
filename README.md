@@ -3,7 +3,7 @@
 This project is based on the original partial-mcp framework developed in the DeepPavlov Lab.
 
 Original repository:
-[https://github.com/ORIGINAL_REPO](https://github.com/deeppavlov/partial-mcp)
+https://github.com/deeppavlov/partial-mcp
 
 My contribution includes:
 - multi-turn evaluation benchmark
